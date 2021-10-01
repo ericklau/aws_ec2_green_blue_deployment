@@ -1,0 +1,244 @@
+---
+# tasks file for aws_ec2_green_blue_deployment
+
+- name: Get the AMI
+  ec2_ami_facts:
+    region: "{{ aws_region }}"
+    image_id: "{{ ami_id }}"
+  register: ami
+
+- name: The AMI is Found
+  debug:
+    msg: "{{ ami.images[0].image_id }}"
+    #verbosity: 3
+
+- name: Search for the existing most recent launch configurations if avaliable (Green)
+  community.aws.ec2_lc_find:
+    name_regex: lc_build_number*
+    sort_order: descending
+    limit: 1
+  register: green_lc
+  ignore_errors: yes
+
+- name: set fact if intial green launch configurations
+  set_fact:
+    intial_green_deployment: "{{ 'true' if green_lc.results[0].arn is not defined else 'false' }}"
+
+- name: print out the variables
+  debug:
+    msg: "{{ intial_green_deployment }}"
+
+- name: The Launch configuration is Found
+  debug:
+    msg: "{{ green_lc.results[0].arn }}"
+  when: not intial_green_deployment
+
+- name: set fact for green launch configurations
+  set_fact:
+    green_lc_arn: "{{ green_lc.results[0].arn }}"
+  when: not intial_green_deployment
+
+- name: The Launch configuration is less than 0
+  debug:
+    msg: "{{ green_lc_arn | length > 0 }}"
+  when: green_lc is not defined
+
+- name: Fail If the AMI Is Not Found
+  fail:
+    msg: "Got {{ ami.images|length }} AMI(s), expected 1. Please check `ami_id` parameter."
+  when: ami.images|length != 1
+
+# - name: intial deployment
+#   import_task: blue_deployment.yml
+#   when: not initial_green-deployment
+#
+# - name: intial deployment
+#   import_task: green_deployment.yml
+#   when: initial_green-deployment
+
+- name: Create launch configuration (Green)
+  community.aws.ec2_lc:
+    name: lc_build_number #{{ launch_config }}
+    user_data: "{{ lookup('file', 'user_data.sh') }}"
+    image_id: "{{ ami.images[0].image_id }}"
+    assign_public_ip: yes
+    instance_type: t2.micro
+    key_name: ansible
+    security_groups: ['sg-0e915d40e02b4252d']
+    volumes:
+    - device_name: /dev/xvda
+      volume_size: 8
+      volume_type: gp2
+      iops: 100
+      delete_on_termination: true
+  register: lc_info
+  when: not intial_green_deployment
+
+- name: Create a initial target group (Green)
+  elb_target_group:
+    name: tg-test-build-number-project
+    state: present
+    region: '{{ aws_region }}'
+    vpc_id: '{{ vpc_id }}'
+    protocol: '{{ protocol }}'
+    port: '{{ port }}'
+    health_check_interval: '{{ health_check_interval }}'
+    health_check_path: '{{ health_check_path }}'
+    health_check_port: '{{ health_check_port }}'
+    health_check_protocol: '{{ health_check_protocol }}'
+    health_check_timeout: '{{ health_check_timeout }}'
+    healthy_threshold_count: '{{ healthy_threshold_count }}'
+    unhealthy_threshold_count: '{{ unhealthy_threshold_count }}'
+  register: green_target_group
+  until: green_target_group is defined
+  when: not intial_green_deployment
+  retries: 5
+  delay: 5
+
+- name: Creates a new set of listeners rules for the ALB (Green)
+  elb_application_lb:
+    name: '{{ alb_name }}'
+    state: present
+    region: '{{ aws_region }}'
+    security_groups: '{{ alb_security_groups }}'
+    subnets: '{{ alb_subnets }}'
+    listeners: '{{ listeners }}'
+  register: alb_with_new_listeners
+  when: not intial_green_deployment
+
+- name: Create a new Auto Scaling Group (Green)
+  community.aws.ec2_asg:
+    name: myasg-ebsv1
+    #load_balancers: [ '{{ elb_info.load_balancers[0].load_balancer_name }}' ]
+    vpc_zone_identifier: '{{ alb_subnets }}'
+    target_group_arns: '{{ green_target_group.target_group_arn }}'
+    launch_config_name: '{{ lc_info.name }}'
+    health_check_period: 300
+    health_check_type: ELB
+    min_size: 1
+    max_size: 2
+    desired_capacity: "{{ desired_instance_size }}"
+    wait_for_instances: yes
+    wait_timeout: 300
+    region: "{{ aws_region }}"
+    tags:
+      - environment: dev
+      - name:
+        propagate_at_launch: yes
+  register: ec2_asg_results
+  when: not intial_green_deployment
+  retries: 10
+  delay: 60
+
+# Start this play to swap Load balancer
+#  _________________________ ______________________________
+# < NEW DEPLOYMENT (BLUE) >
+#  --------------------------------------------------------
+#         \   ^__^
+#          \  (oo)\_______
+#             (__)\       )\/\
+#                 ||----w |
+#                 ||     ||
+
+- name: Create launch configuration (Blue)
+  community.aws.ec2_lc:
+    name: lc_build_number_v2 #{{ launch_config }}
+    user_data: "{{ lookup('file', 'user_datav2.sh') }}"
+    image_id: "{{ ami.images[0].image_id }}"
+    assign_public_ip: yes
+    instance_type: t2.micro
+    key_name: ansible
+    security_groups: ['sg-0e915d40e02b4252d']
+    volumes:
+    - device_name: /dev/xvda
+      volume_size: 8
+      volume_type: gp2
+      iops: 100
+      delete_on_termination: true
+  register: lc_infov2
+  when: intial_green_deployment
+
+- name: Create a new target group (Blue)
+  elb_target_group:
+    name: tg-test-build-number-project-v2
+    state: present
+    region: '{{ aws_region }}'
+    vpc_id: '{{ vpc_id }}'
+    protocol: '{{ protocol }}'
+    port: '{{ port }}'
+    health_check_interval: '{{ health_check_interval }}'
+    health_check_path: '{{ health_check_path }}'
+    health_check_port: '{{ health_check_port }}'
+    health_check_protocol: '{{ health_check_protocol }}'
+    health_check_timeout: '{{ health_check_timeout }}'
+    healthy_threshold_count: '{{ healthy_threshold_count }}'
+    unhealthy_threshold_count: '{{ unhealthy_threshold_count }}'
+  register: blue_target_group
+  until: blue_target_group is defined
+  retries: 5
+  delay: 5
+  when: intial_green_deployment
+
+- name: Creates a new set of listeners rules for the ALB v2 (Blue)
+  elb_application_lb:
+    name: '{{ alb_namev2 }}'
+    state: present
+    region: '{{ aws_region }}'
+    security_groups: '{{ alb_security_groups }}'
+    subnets: '{{ alb_subnets }}'
+    listeners: '{{ listenersv2 }}'
+  register: alb_with_new_listeners
+  when: intial_green_deployment
+
+- name: Create a new Auto Scaling Group (Blue)
+  community.aws.ec2_asg:
+    name: myasg-ebsv2
+    #load_balancers: [ '{{ elb_info.load_balancers[0].load_balancer_name }}' ]
+    vpc_zone_identifier: '{{ alb_subnets }}'
+    target_group_arns: '{{ blue_target_group.target_group_arn }}'
+    launch_config_name: '{{ lc_infov2.name }}'
+    health_check_period: 300
+    health_check_type: ELB
+    min_size: 1
+    max_size: 2
+    desired_capacity: "{{ desired_instance_size }}"
+    wait_for_instances: yes
+    wait_timeout: 300
+    region: "{{ aws_region }}"
+  register: ec2_asg_returnv2
+  retries: 5
+  delay: 60
+  when: intial_green_deployment
+
+- name: Unattach ELB
+  elb_application_lb:
+    name: '{{ alb_namev2 }}'
+    state: present
+    region: '{{ aws_region }}'
+    security_groups: '{{ alb_security_groups }}'
+    subnets: '{{ alb_subnets }}'
+    # listeners: '{{ listeners }}'
+  register: alb_with_new_listeners
+  when: not intial_green_deployment
+
+- name: Unattach ELB
+  elb_application_lb:
+    name: '{{ alb_name }}'
+    state: present
+    region: '{{ aws_region }}'
+    security_groups: '{{ alb_security_groups }}'
+    subnets: '{{ alb_subnets }}'
+    # listeners: '{{ listeners }}'
+  register: alb_with_new_listeners
+  when: not intial_green_deployment
+
+- name: Flip the switch :)
+  elb_application_lb:
+    name: '{{ alb_namev2 }}'
+    state: present
+    region: '{{ aws_region }}'
+    security_groups: '{{ alb_security_groups }}'
+    subnets: '{{ alb_subnets }}'
+    listeners: '{{ listeners }}'
+  register: alb_with_new_listeners
+  when: not intial_green_deployment
