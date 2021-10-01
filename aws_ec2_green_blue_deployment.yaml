@@ -1,0 +1,41 @@
+---
+- hosts: localhost
+  gather_facts: true
+  connection: local
+  vars:
+    instance_count: 2
+    aws_region: us-east-1
+    ami_id: ami-00ee9fa46b85cf595
+    alb_name: test-alb
+    alb_namev2: test-albv2
+    alb_security_groups:
+      - sg-0edc9ff5af846fe9c
+    vpc_id: vpc-2c721054
+    desired_instance_size: 1
+    protocol: http
+    port: 80
+    health_check_path: /
+    health_check_protocol: http
+    health_check_port: 80
+    health_check_interval: 30
+    health_check_timeout: 5
+    healthy_threshold_count: 2
+    unhealthy_threshold_count: 3
+    successful_response_codes: 200
+    listeners:
+      - Protocol: HTTP
+        Port: 80
+        DefaultActions:
+        - Type: forward
+          TargetGroupName: tg-test-build-number-project
+    listenersv2:
+     - Protocol: HTTP
+       Port: 80
+       DefaultActions:
+       - Type: forward
+         TargetGroupName: tg-test-build-number-project-v2
+    alb_subnets: 
+      - subnet-15c71b48
+      - subnet-3a325571
+  roles:
+    - role: aws_ec2_green_blue_deployment
